@@ -101,6 +101,60 @@ def api_precompute_cube(cube_id: int) -> dict:
     return svc.run_precomputation(cube_id)
 
 
+# ----------------------------------------------------------------------------
+# 维度来源核对：实时窗口与 Cube 各自保留入口，证据只来自新计算的源事件读取
+# ----------------------------------------------------------------------------
+
+@router.get("/aggregation/{window_id}/dimension-runs")
+def api_window_dimension_runs(window_id: int, limit: int = 20) -> dict:
+    """列出实时窗口历次新计算实际读取的维度批次/事件运行。"""
+    svc = service_for("realtime_agg")
+    runs = svc.list_dimension_runs(window_id, limit=limit)
+    return {"ok": True, "window_id": window_id, "runs": runs}
+
+
+@router.get("/aggregation/dimension-runs/{run_id}")
+def api_window_dimension_run_detail(run_id: int) -> dict:
+    """单次实时窗口计算的逐事件字段读取明细。"""
+    svc = service_for("realtime_agg")
+    detail = svc.dimension_run_detail(run_id)
+    if detail is None:
+        return {"ok": False, "message": f"维度计算运行 {run_id} 不存在"}
+    return {"ok": True, "run": detail}
+
+
+@router.get("/aggregation/{window_id}/provenance")
+def api_window_provenance(window_id: int, dimension_key: str) -> dict:
+    """核对一条已存窗口结果展示键的维度来源（缺键/显式问号/零值）。"""
+    svc = service_for("realtime_agg")
+    return svc.result_provenance(window_id, dimension_key)
+
+
+@router.get("/cube/{cube_id}/dimension-runs")
+def api_cube_dimension_runs(cube_id: int, limit: int = 20) -> dict:
+    """列出 Cube 历次预计算实际读取的维度批次/事件运行。"""
+    svc = service_for("cube_builder")
+    runs = svc.list_dimension_runs(cube_id, limit=limit)
+    return {"ok": True, "cube_id": cube_id, "runs": runs}
+
+
+@router.get("/cube/dimension-runs/{run_id}")
+def api_cube_dimension_run_detail(run_id: int) -> dict:
+    """单次 Cube 预计算的逐事件字段读取明细。"""
+    svc = service_for("cube_builder")
+    detail = svc.dimension_run_detail(run_id)
+    if detail is None:
+        return {"ok": False, "message": f"维度计算运行 {run_id} 不存在"}
+    return {"ok": True, "run": detail}
+
+
+@router.get("/cube/{cube_id}/provenance")
+def api_cube_provenance(cube_id: int, dimension_key: str) -> dict:
+    """核对一个已存 Cube cell 展示键的维度来源（缺键/显式问号/零值）。"""
+    svc = service_for("cube_builder")
+    return svc.cell_provenance(cube_id, dimension_key)
+
+
 @router.post("/report/{report_id}/generate")
 def api_generate_report(report_id: int) -> dict:
     """对指定报告模板执行生成。"""

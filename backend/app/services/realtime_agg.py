@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app import audit
 from app.database import db
 from app.pipeline import compute_aggregation
 from app.services.base import BaseModuleService
@@ -71,6 +72,33 @@ class RealtimeAggService(BaseModuleService):
             "ORDER BY window_start DESC LIMIT 1",
             [window_id, dimension_key],
         )
+
+    # ================================================================
+    # 维度来源核对（新计算审计；旧结果保留原值并标注来源无法确认）
+    # ================================================================
+
+    def list_dimension_runs(self, window_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        """列出窗口历次新计算的维度读取运行（实际读取的批次/事件范围）。"""
+        return audit.list_runs(audit.ENGINE_REALTIME_WINDOW, window_id, limit)
+
+    def dimension_run_detail(self, run_id: int) -> dict[str, Any] | None:
+        """单次实时窗口计算的字段读取明细：实际读了哪些事件、哪些维度字段。"""
+        return audit.run_detail(run_id)
+
+    def result_provenance(self, window_id: int, dimension_key: str) -> dict[str, Any]:
+        """核对一条已存窗口结果（展示键）的来源。
+
+        仅依据新计算落库的源事件字段读取证据，区分缺键记录与显式问号记录；
+        旧组只有展示键时保留原值，成员来源标注为无法确认。
+        """
+        provenance = audit.provenance_for_group(
+            audit.ENGINE_REALTIME_WINDOW, window_id, dimension_key)
+        stored = self.latest_value(window_id, dimension_key)
+        provenance["stored_result"] = stored
+        if stored is not None:
+            provenance["stored_value"] = stored.get("computed_value")
+            provenance["stored_event_count"] = stored.get("event_count")
+        return provenance
 
     # ================================================================
     # 聚合执行

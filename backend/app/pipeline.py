@@ -25,10 +25,12 @@ import json
 import math
 import random
 import statistics
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from app import audit
+from app import dimensions as dimlib
 from app.database import db
 
 
@@ -90,18 +92,21 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
 
     从 events 表读取匹配数据源，按维度分组，在时间窗口内执行聚合函数。
     结果写入 aggregation_results 表，返回新增结果列表。
+
+    维度取值、分组与度量计算统一走 :mod:`app.dimensions`，与 Cube
+    预计算复用同一套维度数据处理；本次实际读取的事件与字段证据写入
+    :mod:`app.audit`，可逐条核对缺键、显式问号和零值。
     """
     window_id = window["id"]
+    # 取值键与默认值保持重构前口径：实时窗口配置历史上以中文字段读取，
+    # 缺键时回退默认值，不额外引入英文列回退，确保原有输入输出不变。
     data_source = window.get("数据源", "")
     dimensions_raw = window.get("聚合维度", "[]")
     agg_func = window.get("聚合函数", "COUNT")
     window_type = window.get("window_type", "tumbling")
     window_size = window.get("窗口大小", window.get("window_size_seconds", 60))
 
-    try:
-        dims = json.loads(dimensions_raw) if isinstance(dimensions_raw, str) else dimensions_raw
-    except (json.JSONDecodeError, TypeError):
-        dims = []
+    dims = dimlib.parse_dimensions(dimensions_raw)
 
     now_dt = datetime.now(timezone.utc)
     window_end = now_dt.replace(microsecond=0)
@@ -120,20 +125,8 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
     if not events:
         return []
 
-    # 按维度分组
-    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for evt in events:
-        if dims:
-            attrs = {}
-            try:
-                attrs = json.loads(evt.get("event_attrs", "{}")) if isinstance(evt.get("event_attrs"), str) else evt.get("event_attrs", {})
-            except (json.JSONDecodeError, TypeError):
-                pass
-            dim_key = "|".join(str(attrs.get(d, "?")) for d in dims)
-        else:
-            dim_key = "__all__"
-
-        groups[dim_key].append(evt)
+    # 共享读取阶段：一次性解析属性、取维度值并分组（两处计算共用同一实现）
+    grouping = dimlib.group_events_by_dimensions(events, dims)
 
     # 执行聚合
     results = []
@@ -143,42 +136,9 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
     )
     comp_version = int(version["v"]) if version else 1
 
-    agg_func_upper = agg_func.upper().strip()
-
-    for dim_key, group_events in groups.items():
-        if agg_func_upper == "COUNT":
-            value = float(len(group_events))
-        elif agg_func_upper in ("SUM", "总金额", "总量"):
-            try:
-                value = sum(float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events)
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper in ("AVG", "均值"):
-            try:
-                vals = [float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events]
-                value = statistics.mean(vals) if vals else 0.0
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper in ("MAX", "最大值"):
-            try:
-                vals = [float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events]
-                value = max(vals) if vals else 0.0
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper in ("MIN", "最小值"):
-            try:
-                vals = [float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group_events]
-                value = min(vals) if vals else 0.0
-            except Exception:
-                value = float(len(group_events))
-        elif agg_func_upper == "COUNT_DISTINCT":
-            try:
-                vals = set(json.loads(e.get("event_attrs", "{}")).get("user_id", "") for e in group_events)
-                value = float(len(vals))
-            except Exception:
-                value = float(len(group_events))
-        else:
-            value = float(len(group_events))
+    for dim_key, group_events in grouping.groups.items():
+        value = dimlib.aggregate_measure(
+            group_events, agg_func, grouping.attrs_by_event_id)
 
         record_id = db.insert("aggregation_results", {
             "window_id": window_id,
@@ -196,6 +156,30 @@ def compute_aggregation(window: dict[str, Any]) -> list[dict[str, Any]]:
             "computed_value": round(value, 4),
             "event_count": len(group_events),
         })
+
+    # 计算审计：记录本次实际读取的批次、事件与逐字段维度取值
+    group_evidence = dimlib.summarize_group_evidence(grouping.reads, dims)
+    run_id = audit.record_compute_run(
+        engine=audit.ENGINE_REALTIME_WINDOW,
+        owner_id=window_id,
+        dimensions=dims,
+        agg_func=str(agg_func),
+        event_ids=[e.get("id") for e in events if e.get("id") is not None],
+        batch_ids=[e.get("batch_id") for e in events],
+        event_query=events_query,
+        event_params=params,
+        group_evidence=group_evidence,
+        window_start=window_start.strftime("%Y-%m-%dT%H:%M:%S"),
+        window_end=window_end.strftime("%Y-%m-%dT%H:%M:%S"),
+        extra={
+            "window_type": window_type,
+            "window_size_seconds": int(window_size),
+            "data_source": data_source,
+            "computation_version": comp_version,
+            "result_ids": [r["id"] for r in results],
+        },
+    )
+    audit.record_event_reads(run_id, [r.to_dict() for r in grouping.reads])
 
     return results
 
@@ -938,54 +922,56 @@ def precompute_cube(cube: dict[str, Any]) -> int:
 
     按维度组合从 events 表聚合指标值，写入 cube_cells 表。
     返回写入的 cell 总数。
+
+    维度取值、分组与度量计算与实时窗口共用 :mod:`app.dimensions` 的同一套
+    实现；本次实际读取的事件批次与逐字段证据写入 :mod:`app.audit`。
     """
     cube_id = cube["id"]
     dims_raw = cube.get("维度组合", cube.get("dimensions", "[]"))
     measure_expr = cube.get("指标计算", cube.get("measure_expr", "COUNT(*)"))
 
-    try:
-        dims = json.loads(dims_raw) if isinstance(dims_raw, str) else dims_raw
-    except (json.JSONDecodeError, TypeError):
-        dims = []
+    dims = dimlib.parse_dimensions(dims_raw)
 
     # 清除旧 cell
     db.delete("cube_cells", "cube_id=?", [cube_id])
+
+    events_query = "SELECT * FROM events"
+    params: list[Any] = []
+    events = db.fetchall(events_query, params)
 
     if not dims:
         # 无维度：全量聚合
         total = db.count("events")
         db.insert("cube_cells", {"cube_id": cube_id, "dimension_values": "{}", "measure_value": float(total)})
+        # 无维度计算仍记录实际读取范围，但没有逐字段维度证据
+        run_id = audit.record_compute_run(
+            engine=audit.ENGINE_CUBE,
+            owner_id=cube_id,
+            dimensions=[],
+            agg_func=str(measure_expr),
+            event_ids=[],
+            batch_ids=[],
+            event_query=events_query,
+            event_params=params,
+            group_evidence={},
+            extra={"fact_table": cube.get("事实表", cube.get("fact_table", "events")),
+                   "no_dimensions": True, "cell_count": 1},
+        )
+        audit.record_event_reads(run_id, [])
         return 1
 
-    # 按维度组合分组聚合
-    events = db.fetchall("SELECT * FROM events")
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-    for evt in events:
-        try:
-            attrs = json.loads(evt.get("event_attrs", "{}")) if isinstance(evt.get("event_attrs"), str) else evt.get("event_attrs", {})
-        except (json.JSONDecodeError, TypeError):
-            attrs = {}
-        dim_key = "|".join(str(attrs.get(d, "?")) for d in dims)
-        grouped[dim_key].append(evt)
+    # 共享读取阶段：与实时窗口完全相同的维度整理逻辑
+    grouping = dimlib.group_events_by_dimensions(events, dims)
 
     cell_count = 0
-    for dim_key, group in grouped.items():
-        dim_vals = {}
-        for d in dims:
-            try:
-                attrs = json.loads(group[0].get("event_attrs", "{}")) if isinstance(group[0].get("event_attrs"), str) else group[0].get("event_attrs", {})
-                dim_vals[d] = attrs.get(d, "?")
-            except (json.JSONDecodeError, TypeError):
-                dim_vals[d] = "?"
+    for dim_key, group in grouping.groups.items():
+        dim_vals = dimlib.cube_dimension_values(
+            group, dims, grouping.attrs_by_event_id)
 
-        if "COUNT" in measure_expr.upper():
+        if "COUNT" in str(measure_expr).upper():
             measure = float(len(group))
-        elif "SUM" in measure_expr.upper():
-            try:
-                measure = sum(float(json.loads(e.get("event_attrs", "{}")).get("amount", 0)) for e in group)
-            except Exception:
-                measure = float(len(group))
+        elif "SUM" in str(measure_expr).upper():
+            measure = dimlib.aggregate_measure(group, "SUM", grouping.attrs_by_event_id)
         else:
             measure = float(len(group))
 
@@ -995,6 +981,25 @@ def precompute_cube(cube: dict[str, Any]) -> int:
             "measure_value": round(measure, 4),
         })
         cell_count += 1
+
+    # 计算审计：记录全表读取范围、批次与逐字段维度取值
+    group_evidence = dimlib.summarize_group_evidence(grouping.reads, dims)
+    run_id = audit.record_compute_run(
+        engine=audit.ENGINE_CUBE,
+        owner_id=cube_id,
+        dimensions=dims,
+        agg_func=str(measure_expr),
+        event_ids=[e.get("id") for e in events if e.get("id") is not None],
+        batch_ids=[e.get("batch_id") for e in events],
+        event_query=events_query,
+        event_params=params,
+        group_evidence=group_evidence,
+        extra={
+            "fact_table": cube.get("事实表", cube.get("fact_table", "events")),
+            "cell_count": cell_count,
+        },
+    )
+    audit.record_event_reads(run_id, [r.to_dict() for r in grouping.reads])
 
     # 更新 cube 元数据
     db.update("cubes", {

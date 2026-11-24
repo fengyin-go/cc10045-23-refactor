@@ -188,6 +188,43 @@ DDL_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_cc_cube ON cube_cells(cube_id)",
 
+    # ==================== Dimension Provenance / Audit Tier ====================
+    # 实时窗口与 Cube 共用的维度计算审计：运行头 + 逐事件字段读取证据。
+    # 证据只来自源事件 event_attrs 的实际读取，不来自输出展示键。
+    """CREATE TABLE IF NOT EXISTS dimension_compute_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        engine TEXT NOT NULL,
+        owner_id INTEGER NOT NULL,
+        dimensions_json TEXT NOT NULL DEFAULT '[]',
+        agg_function TEXT NOT NULL DEFAULT '',
+        window_start TEXT,
+        window_end TEXT,
+        event_count INTEGER NOT NULL DEFAULT 0,
+        event_ids_json TEXT NOT NULL DEFAULT '[]',
+        batch_ids_json TEXT NOT NULL DEFAULT '[]',
+        event_query TEXT NOT NULL DEFAULT '',
+        event_params_json TEXT NOT NULL DEFAULT '[]',
+        group_evidence_json TEXT NOT NULL DEFAULT '{}',
+        extra_json TEXT NOT NULL DEFAULT '{}',
+        computed_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_dcr_engine_owner ON dimension_compute_runs(engine, owner_id)",
+
+    """CREATE TABLE IF NOT EXISTS dimension_event_reads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        event_id INTEGER,
+        event_name TEXT NOT NULL DEFAULT '',
+        batch_id TEXT,
+        group_key TEXT NOT NULL DEFAULT '',
+        field_reads_json TEXT NOT NULL DEFAULT '[]',
+        parse_error TEXT,
+        read_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (run_id) REFERENCES dimension_compute_runs(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_der_run ON dimension_event_reads(run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_der_event ON dimension_event_reads(event_id)",
+
     # ==================== Anomaly Tier ====================
     """CREATE TABLE IF NOT EXISTS anomaly_analyses (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
